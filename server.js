@@ -1,168 +1,236 @@
 // ================================================================
-//  FruitAlarm — backend/server.js
-//  
-//  This is your "stock bot". It's a tiny web server that:
-//  1. Scrapes the Blox Fruits Wiki every 4 hours for live stock
-//  2. Saves it in memory
-//  3. Lets your app fetch it with a simple URL call
-//
-//  DEPLOY FREE on Render.com — full instructions in README.md
+//  FruitAlarm Backend v3
+//  Scrapes fruityblox.com/stock — real in-game stock data
+//  Separate Normal + Mirage sections parsed cleanly
 // ================================================================
 
-const https  = require("https");
-const http   = require("http");
-const PORT   = process.env.PORT || 3000;
+const https = require("https");
+const http  = require("http");
+const PORT  = process.env.PORT || 3000;
 
-// ── Stock cache ───────────────────────────────────────────────────
-let stockCache = {
-  fruits:      [],
+// ── Cache ─────────────────────────────────────────────────────────
+let cache = {
+  normalStock: [],
+  mirageStock: [],
   lastUpdated: null,
-  nextReset:   null,
-  source:      "pending",
+  nextResetNormal: null,
+  nextResetMirage: null,
+  source: "pending",
 };
 
-// ── Rarity map ────────────────────────────────────────────────────
-const RARITY = {
-  "kitsune":"mythical","dragon":"mythical","leopard":"mythical",
-  "control":"mythical","dough":"mythical","venom":"mythical",
-  "soul":"mythical","gas":"mythical","t-rex":"mythical","mammoth":"mythical",
-  "buddha":"legendary","shadow":"legendary","blizzard":"legendary",
-  "rumble":"legendary","quake":"legendary","gravity":"legendary",
-  "phoenix":"legendary","portal":"legendary","pain":"legendary",
-  "dark":"legendary","light":"legendary","magma":"legendary",
-  "flame":"legendary","ice":"legendary","sand":"legendary",
-  "spin":"legendary","lightning":"legendary","eagle":"legendary",
-  "rubber":"rare","spider":"rare","love":"rare","diamond":"rare",
-  "smoke":"rare","spike":"rare","bomb":"rare","ghost":"rare",
-  "creation":"rare","barrier":"rare","door":"rare","string":"rare",
-  "paw":"rare","falcon":"rare",
-  "rocket":"common","spring":"common","kilo":"common","chop":"common",
-  "slow":"common","revive":"common","stomp":"common",
-};
+// ── Known fruit IDs (matches our fruits.js database) ─────────────
+const KNOWN_FRUITS = new Set([
+  "rocket","spin","blade","spring","bomb","smoke","spike",
+  "flame","ice","sand","dark","eagle","diamond",
+  "light","rubber","ghost","magma",
+  "quake","buddha","love","creation","spider","sound",
+  "portal","phoenix","lightning","blizzard","pain",
+  "gravity","mammoth","trex","t-rex","dough","shadow",
+  "venom","gas","spirit","tiger","yeti","kitsune","control","dragon",
+]);
 
-// ── Wiki scraper ──────────────────────────────────────────────────
-function scrapeWiki() {
+// Normalise fruit name from URL slug → our fruit id
+function slugToId(slug) {
+  const s = slug.toLowerCase().trim();
+  if (s === "t-rex") return "trex";
+  return s;
+}
+
+// ── Fetch fruityblox.com/stock ────────────────────────────────────
+function fetchPage() {
   return new Promise((resolve, reject) => {
     const options = {
-      hostname: "blox-fruits.fandom.com",
-      path:     '/wiki/Blox_Fruits_%22Stock%22',
+      hostname: "fruityblox.com",
+      path:     "/stock",
       method:   "GET",
-      headers:  {
-        "User-Agent": "FruitAlarm-StockBot/1.0 (educational fan project)",
-        "Accept":     "text/html",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; FruitAlarm-Bot/3.0; fan project)",
+        "Accept":     "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
       },
-      timeout: 10000,
+      timeout: 12000,
     };
 
-    const req = https.request(options, (res) => {
+    const req = https.request(options, res => {
+      // Follow redirect if needed
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        console.log(`Redirected to ${res.headers.location}`);
+        resolve(fetchUrl(res.headers.location));
+        return;
+      }
       let html = "";
       res.on("data", chunk => html += chunk);
-      res.on("end", () => {
-        try {
-          const fruits = parseStockFromHtml(html);
-          if (fruits.length === 0) {
-            reject(new Error("Parsed 0 fruits"));
-          } else {
-            resolve(fruits);
-          }
-        } catch (e) { reject(e); }
-      });
+      res.on("end", () => resolve(html));
     });
-
-    req.on("error",   reject);
+    req.on("error", reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
     req.end();
   });
 }
 
-// ── HTML parser ───────────────────────────────────────────────────
-function parseStockFromHtml(html) {
-  const found = [];
-  const knownFruits = new Set(Object.keys(RARITY));
-  const linkPattern = /href="\/wiki\/([^"#?]+)(?:#[^"]*)?"/g;
+// ── Parse stock from HTML ─────────────────────────────────────────
+// fruityblox.com structure:
+//   ## Normal  ... /items/fruitname links ...
+//   ## Mirage  ... /items/fruitname links ...
+function parseStock(html) {
+  const normalFruits = [];
+  const mirageFruits = [];
 
-  let match;
-  while ((match = linkPattern.exec(html)) !== null) {
-    const raw  = decodeURIComponent(match[1]).replace(/_/g, " ");
-    const name = raw.trim();
-    const key  = name.toLowerCase();
-    if (knownFruits.has(key) && !found.includes(name)) {
-      found.push(name);
+  // Find the Normal and Mirage section boundaries
+  const normalIdx = html.indexOf("## Normal");
+  const mirageIdx = html.indexOf("## Mirage");
+
+  if (normalIdx === -1 && mirageIdx === -1) {
+    throw new Error("Could not find Normal or Mirage sections in page");
+  }
+
+  // Extract Normal section HTML
+  const normalSection = normalIdx !== -1
+    ? html.slice(normalIdx, mirageIdx !== -1 ? mirageIdx : normalIdx + 5000)
+    : "";
+
+  // Extract Mirage section HTML (everything after ## Mirage)
+  const mirageSection = mirageIdx !== -1
+    ? html.slice(mirageIdx, mirageIdx + 5000)
+    : "";
+
+  // Parse fruit slugs from /items/fruitname links
+  const itemPattern = /\/items\/([a-zA-Z0-9_-]+)/g;
+
+  let m;
+  const seenNormal = new Set();
+  while ((m = itemPattern.exec(normalSection)) !== null) {
+    const id = slugToId(m[1]);
+    if (KNOWN_FRUITS.has(id) && !seenNormal.has(id)) {
+      seenNormal.add(id);
+      normalFruits.push(id);
     }
   }
 
-  // Fallback: scan table cells
-  if (found.length < 2) {
-    const cellPattern = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-    while ((match = cellPattern.exec(html)) !== null) {
-      const cellText = match[1].replace(/<[^>]+>/g, "").trim();
-      const key = cellText.toLowerCase();
-      if (knownFruits.has(key) && !found.includes(cellText)) {
-        found.push(cellText);
-      }
+  itemPattern.lastIndex = 0;
+  const seenMirage = new Set();
+  while ((m = itemPattern.exec(mirageSection)) !== null) {
+    const id = slugToId(m[1]);
+    if (KNOWN_FRUITS.has(id) && !seenMirage.has(id)) {
+      seenMirage.add(id);
+      mirageFruits.push(id);
     }
   }
-  return found;
+
+  return { normalFruits, mirageFruits };
 }
 
-// ── Next 4-hour reset ─────────────────────────────────────────────
-function getNextReset() {
-  const now  = new Date();
-  const h    = now.getUTCHours();
-  const next = new Date(now);
-  next.setUTCHours(Math.ceil((h + 1) / 4) * 4 % 24, 0, 0, 0);
-  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
-  return next.toISOString();
+// ── Next reset times ──────────────────────────────────────────────
+function getNextReset(cycleHours) {
+  const now    = new Date();
+  const sec    = now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
+  const cycle  = cycleHours * 3600;
+  const rem    = cycle - (sec % cycle);
+  return new Date(now.getTime() + rem * 1000).toISOString();
 }
 
-// ── Refresh ───────────────────────────────────────────────────────
-async function refreshStock() {
-  console.log(`[${new Date().toISOString()}] Refreshing from wiki...`);
+// ── Main refresh ──────────────────────────────────────────────────
+async function refresh() {
+  console.log(`\n[${new Date().toISOString()}] Fetching stock from fruityblox.com...`);
   try {
-    const fruits = await scrapeWiki();
-    stockCache = { fruits, lastUpdated: new Date().toISOString(), nextReset: getNextReset(), source: "wiki" };
-    console.log(`Stock updated: ${fruits.join(", ")}`);
+    const html = await fetchPage();
+
+    if (!html || html.length < 500) {
+      throw new Error(`Page too short (${html?.length} chars) — likely blocked or error page`);
+    }
+
+    const { normalFruits, mirageFruits } = parseStock(html);
+
+    if (normalFruits.length === 0 && mirageFruits.length === 0) {
+      throw new Error("Parsed 0 fruits from both sections — page structure may have changed");
+    }
+
+    cache = {
+      normalStock:     normalFruits,
+      mirageStock:     mirageFruits,
+      lastUpdated:     new Date().toISOString(),
+      nextResetNormal: getNextReset(4),
+      nextResetMirage: getNextReset(2),
+      source:          "fruityblox",
+    };
+
+    console.log(`✅ Normal stock (${normalFruits.length}): ${normalFruits.join(", ") || "none"}`);
+    console.log(`✅ Mirage stock (${mirageFruits.length}): ${mirageFruits.join(", ") || "none"}`);
+
   } catch (err) {
-    console.error(`Scrape failed: ${err.message}`);
-    if (stockCache.fruits.length > 0) {
-      stockCache.source = "cached";
+    console.error(`❌ Scrape failed: ${err.message}`);
+
+    if (cache.normalStock.length > 0) {
+      // Keep existing cache, just mark it as stale
+      cache.source = "cached";
+      cache.lastUpdated = new Date().toISOString();
+      console.log(`⚠️  Serving cached stock: ${cache.normalStock.join(", ")}`);
     } else {
-      stockCache = { fruits: ["Flame","Ice","Smoke"], lastUpdated: new Date().toISOString(), nextReset: getNextReset(), source: "fallback" };
+      // Absolute fallback — real common fruits that are almost always in stock
+      cache = {
+        normalStock:     ["rocket", "spin"],
+        mirageStock:     [],
+        lastUpdated:     new Date().toISOString(),
+        nextResetNormal: getNextReset(4),
+        nextResetMirage: getNextReset(2),
+        source:          "fallback",
+      };
+      console.log(`⚠️  Using minimal fallback stock`);
     }
   }
 }
 
-// ── HTTP server ───────────────────────────────────────────────────
+// ── HTTP Server ───────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Content-Type", "application/json");
+
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const path = req.url.split("?")[0];
 
+  // ── /stock  — what your app calls ──
   if (path === "/stock") {
     res.writeHead(200);
-    res.end(JSON.stringify(stockCache));
+    res.end(JSON.stringify(cache));
     return;
   }
+
+  // ── /health — Render.com uptime check ──
   if (path === "/health") {
     res.writeHead(200);
-    res.end(JSON.stringify({ status: "ok", fruitsInCache: stockCache.fruits.length }));
+    res.end(JSON.stringify({
+      status: "ok",
+      source: cache.source,
+      normalCount: cache.normalStock.length,
+      mirageCount: cache.mirageStock.length,
+      lastUpdated: cache.lastUpdated,
+    }));
     return;
   }
+
+  // ── /force-refresh — manually trigger a new scrape ──
   if (path === "/force-refresh") {
-    refreshStock();
+    refresh(); // fire and forget
     res.writeHead(202);
-    res.end(JSON.stringify({ message: "Refresh started" }));
+    res.end(JSON.stringify({ message: "Refresh started — check /stock in a few seconds" }));
     return;
   }
+
   res.writeHead(404);
-  res.end(JSON.stringify({ error: "Not found" }));
+  res.end(JSON.stringify({ error: "Not found. Try /stock or /health" }));
 });
 
+// ── Start ─────────────────────────────────────────────────────────
 server.listen(PORT, async () => {
-  console.log(`FruitAlarm backend running on port ${PORT}`);
-  await refreshStock();
-  setInterval(refreshStock, 14_400_000); // every 4 hours
+  console.log(`\n🍈 FruitAlarm backend v3 running on port ${PORT}`);
+  console.log(`   Source: fruityblox.com/stock`);
+  console.log(`   Auto-refresh: every 4 hours\n`);
+  // Fetch immediately on boot
+  await refresh();
+  // Then every 4 hours (Normal stock cycle)
+  setInterval(refresh, 4 * 60 * 60 * 1000);
+  // Also refresh at every Mirage reset (every 2 hours)
+  setInterval(refresh, 2 * 60 * 60 * 1000);
 });
