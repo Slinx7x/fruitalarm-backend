@@ -1,7 +1,8 @@
 // ================================================================
-//  FruitAlarm Backend v3
-//  Scrapes fruityblox.com/stock — real in-game stock data
-//  Separate Normal + Mirage sections parsed cleanly
+//  FruitAlarm Backend v4
+//  Uses blox-fruits-api.onrender.com — real JSON stock API
+//  No scraping, no HTML parsing. Clean JSON in, clean JSON out.
+//  Falls back to Fandom Wiki text parse if API is down.
 // ================================================================
 
 const https = require("https");
@@ -10,173 +11,192 @@ const PORT  = process.env.PORT || 3000;
 
 // ── Cache ─────────────────────────────────────────────────────────
 let cache = {
-  normalStock: [],
-  mirageStock: [],
-  lastUpdated: null,
+  normalStock:     [],
+  mirageStock:     [],
+  lastUpdated:     null,
   nextResetNormal: null,
   nextResetMirage: null,
-  source: "pending",
+  source:          "pending",
 };
 
-// ── Known fruit IDs (matches our fruits.js database) ─────────────
+// ── Known fruit IDs — must match fruits.js exactly ───────────────
 const KNOWN_FRUITS = new Set([
   "rocket","spin","blade","spring","bomb","smoke","spike",
   "flame","ice","sand","dark","eagle","diamond",
   "light","rubber","ghost","magma",
   "quake","buddha","love","creation","spider","sound",
   "portal","phoenix","lightning","blizzard","pain",
-  "gravity","mammoth","trex","t-rex","dough","shadow",
+  "gravity","mammoth","trex","dough","shadow",
   "venom","gas","spirit","tiger","yeti","kitsune","control","dragon",
 ]);
 
-// Normalise fruit name from URL slug → our fruit id
-function slugToId(slug) {
-  const s = slug.toLowerCase().trim();
-  if (s === "t-rex") return "trex";
-  return s;
+// Normalise any fruit name/slug → our fruit id
+function toId(raw) {
+  return raw
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]/g, "")  // remove dashes, spaces, special chars
+    .replace("trex", "trex");   // keep as-is
 }
 
-// ── Fetch fruityblox.com/stock ────────────────────────────────────
-function fetchPage() {
+// ── Simple HTTPS GET ──────────────────────────────────────────────
+function get(hostname, path) {
   return new Promise((resolve, reject) => {
-    const options = {
-      hostname: "fruityblox.com",
-      path:     "/stock",
-      method:   "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; FruitAlarm-Bot/3.0; fan project)",
-        "Accept":     "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
+    const req = https.request(
+      {
+        hostname,
+        path,
+        method: "GET",
+        headers: {
+          "User-Agent": "FruitAlarm/4.0 (fan project; github.com/fruitalarm)",
+          "Accept":     "application/json, text/html",
+        },
+        timeout: 12000,
       },
-      timeout: 12000,
-    };
-
-    const req = https.request(options, res => {
-      // Follow redirect if needed
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        console.log(`Redirected to ${res.headers.location}`);
-        resolve(fetchUrl(res.headers.location));
-        return;
+      res => {
+        let body = "";
+        res.on("data", c => body += c);
+        res.on("end", () => resolve({ status: res.statusCode, body }));
       }
-      let html = "";
-      res.on("data", chunk => html += chunk);
-      res.on("end", () => resolve(html));
-    });
-    req.on("error", reject);
+    );
+    req.on("error",   reject);
     req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
     req.end();
   });
 }
 
-// ── Parse stock from HTML ─────────────────────────────────────────
-// fruityblox.com structure:
-//   ## Normal  ... /items/fruitname links ...
-//   ## Mirage  ... /items/fruitname links ...
-function parseStock(html) {
-  const normalFruits = [];
-  const mirageFruits = [];
+// ── SOURCE 1: blox-fruits-api.onrender.com ───────────────────────
+// Returns JSON like:
+// { "Normal": ["Flame","Ice","Diamond"], "Mirage": ["Kitsune","Dough"] }
+// (exact format may vary — we handle multiple possible shapes)
+async function fetchFromCommunityAPI() {
+  const { status, body } = await get(
+    "blox-fruits-api.onrender.com",
+    "/api/bloxfruits/stock"
+  );
 
-  // Find the Normal and Mirage section boundaries
-  const normalIdx = html.indexOf("## Normal");
-  const mirageIdx = html.indexOf("## Mirage");
+  if (status !== 200) throw new Error(`API returned HTTP ${status}`);
 
-  if (normalIdx === -1 && mirageIdx === -1) {
-    throw new Error("Could not find Normal or Mirage sections in page");
+  // The API may return a JSON string or object
+  let data = body;
+  if (typeof data === "string") {
+    data = JSON.parse(data);
+    // API wraps in another string sometimes
+    if (typeof data === "string") data = JSON.parse(data);
   }
 
-  // Extract Normal section HTML
-  const normalSection = normalIdx !== -1
-    ? html.slice(normalIdx, mirageIdx !== -1 ? mirageIdx : normalIdx + 5000)
-    : "";
+  // Handle multiple possible response shapes
+  let normalRaw = [];
+  let mirageRaw = [];
 
-  // Extract Mirage section HTML (everything after ## Mirage)
-  const mirageSection = mirageIdx !== -1
-    ? html.slice(mirageIdx, mirageIdx + 5000)
-    : "";
+  if (Array.isArray(data)) {
+    // Shape: [ { name:"Flame", type:"normal" }, ... ]
+    normalRaw = data.filter(f => (f.type||"").toLowerCase() !== "mirage").map(f => f.name || f.fruit || f);
+    mirageRaw = data.filter(f => (f.type||"").toLowerCase() === "mirage").map(f => f.name || f.fruit || f);
+  } else if (data.Normal || data.normal) {
+    // Shape: { Normal: [...], Mirage: [...] }
+    normalRaw = data.Normal || data.normal || [];
+    mirageRaw = data.Mirage || data.mirage || [];
+  } else if (data.stock) {
+    normalRaw = data.stock;
+  } else {
+    // Last resort — grab any array values
+    const vals = Object.values(data);
+    normalRaw = vals.find(v => Array.isArray(v)) || [];
+  }
 
-  // Parse fruit slugs from /items/fruitname links
-  const itemPattern = /\/items\/([a-zA-Z0-9_-]+)/g;
+  const normalStock = normalRaw.map(toId).filter(id => KNOWN_FRUITS.has(id));
+  const mirageStock = mirageRaw.map(toId).filter(id => KNOWN_FRUITS.has(id));
 
+  if (normalStock.length === 0) throw new Error("API returned 0 valid fruits");
+
+  return { normalStock, mirageStock, source: "community-api" };
+}
+
+// ── SOURCE 2: Fandom Wiki plain text (fallback) ───────────────────
+// The wiki's raw action=raw endpoint returns clean Lua text
+// with fruit names we can regex out easily
+async function fetchFromWiki() {
+  const { status, body } = await get(
+    "blox-fruits.fandom.com",
+    "/wiki/Blox_Fruits_%22Stock%22?action=raw"
+  );
+
+  if (status !== 200) throw new Error(`Wiki returned HTTP ${status}`);
+
+  const found = [];
+  // Wiki raw format has fruit names as wiki links: [[FruitName]]
+  const pattern = /\[\[([A-Za-z\-]+)\]\]/g;
   let m;
-  const seenNormal = new Set();
-  while ((m = itemPattern.exec(normalSection)) !== null) {
-    const id = slugToId(m[1]);
-    if (KNOWN_FRUITS.has(id) && !seenNormal.has(id)) {
-      seenNormal.add(id);
-      normalFruits.push(id);
-    }
+  while ((m = pattern.exec(body)) !== null) {
+    const id = toId(m[1]);
+    if (KNOWN_FRUITS.has(id) && !found.includes(id)) found.push(id);
   }
 
-  itemPattern.lastIndex = 0;
-  const seenMirage = new Set();
-  while ((m = itemPattern.exec(mirageSection)) !== null) {
-    const id = slugToId(m[1]);
-    if (KNOWN_FRUITS.has(id) && !seenMirage.has(id)) {
-      seenMirage.add(id);
-      mirageFruits.push(id);
-    }
-  }
+  if (found.length === 0) throw new Error("Wiki parse returned 0 fruits");
 
-  return { normalFruits, mirageFruits };
+  return { normalStock: found, mirageStock: [], source: "wiki" };
 }
 
 // ── Next reset times ──────────────────────────────────────────────
-function getNextReset(cycleHours) {
-  const now    = new Date();
-  const sec    = now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
-  const cycle  = cycleHours * 3600;
-  const rem    = cycle - (sec % cycle);
-  return new Date(now.getTime() + rem * 1000).toISOString();
+function nextReset(cycleHours) {
+  const now   = new Date();
+  const sec   = now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
+  const cycle = cycleHours * 3600;
+  return new Date(now.getTime() + (cycle - sec % cycle) * 1000).toISOString();
 }
 
-// ── Main refresh ──────────────────────────────────────────────────
+// ── Main refresh — tries sources in order ─────────────────────────
 async function refresh() {
-  console.log(`\n[${new Date().toISOString()}] Fetching stock from fruityblox.com...`);
+  console.log(`\n[${new Date().toISOString()}] Refreshing stock...`);
+
+  let result = null;
+
+  // Try community API first
   try {
-    const html = await fetchPage();
+    result = await fetchFromCommunityAPI();
+    console.log(`✅ Community API → Normal: ${result.normalStock.join(", ")||"none"}`);
+    console.log(`✅ Community API → Mirage: ${result.mirageStock.join(", ")||"none"}`);
+  } catch (e) {
+    console.warn(`⚠️  Community API failed: ${e.message}`);
+  }
 
-    if (!html || html.length < 500) {
-      throw new Error(`Page too short (${html?.length} chars) — likely blocked or error page`);
+  // Fallback to wiki
+  if (!result) {
+    try {
+      result = await fetchFromWiki();
+      console.log(`✅ Wiki fallback → Normal: ${result.normalStock.join(", ")||"none"}`);
+    } catch (e) {
+      console.warn(`⚠️  Wiki fallback failed: ${e.message}`);
     }
+  }
 
-    const { normalFruits, mirageFruits } = parseStock(html);
-
-    if (normalFruits.length === 0 && mirageFruits.length === 0) {
-      throw new Error("Parsed 0 fruits from both sections — page structure may have changed");
-    }
-
+  // Update cache
+  if (result) {
     cache = {
-      normalStock:     normalFruits,
-      mirageStock:     mirageFruits,
+      normalStock:     result.normalStock,
+      mirageStock:     result.mirageStock,
       lastUpdated:     new Date().toISOString(),
-      nextResetNormal: getNextReset(4),
-      nextResetMirage: getNextReset(2),
-      source:          "fruityblox",
+      nextResetNormal: nextReset(4),
+      nextResetMirage: nextReset(2),
+      source:          result.source,
     };
-
-    console.log(`✅ Normal stock (${normalFruits.length}): ${normalFruits.join(", ") || "none"}`);
-    console.log(`✅ Mirage stock (${mirageFruits.length}): ${mirageFruits.join(", ") || "none"}`);
-
-  } catch (err) {
-    console.error(`❌ Scrape failed: ${err.message}`);
-
-    if (cache.normalStock.length > 0) {
-      // Keep existing cache, just mark it as stale
-      cache.source = "cached";
-      cache.lastUpdated = new Date().toISOString();
-      console.log(`⚠️  Serving cached stock: ${cache.normalStock.join(", ")}`);
-    } else {
-      // Absolute fallback — real common fruits that are almost always in stock
-      cache = {
-        normalStock:     ["rocket", "spin"],
-        mirageStock:     [],
-        lastUpdated:     new Date().toISOString(),
-        nextResetNormal: getNextReset(4),
-        nextResetMirage: getNextReset(2),
-        source:          "fallback",
-      };
-      console.log(`⚠️  Using minimal fallback stock`);
-    }
+  } else if (cache.normalStock.length > 0) {
+    // Keep stale cache
+    cache.source      = "cached";
+    cache.lastUpdated = new Date().toISOString();
+    console.log(`⚠️  All sources failed — serving stale cache`);
+  } else {
+    // Absolute last resort
+    cache = {
+      normalStock:     ["rocket", "spin"],
+      mirageStock:     [],
+      lastUpdated:     new Date().toISOString(),
+      nextResetNormal: nextReset(4),
+      nextResetMirage: nextReset(2),
+      source:          "fallback",
+    };
+    console.log(`❌ All sources failed — serving minimal fallback`);
   }
 }
 
@@ -185,36 +205,30 @@ const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Content-Type", "application/json");
-
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   const path = req.url.split("?")[0];
 
-  // ── /stock  — what your app calls ──
   if (path === "/stock") {
     res.writeHead(200);
     res.end(JSON.stringify(cache));
     return;
   }
-
-  // ── /health — Render.com uptime check ──
   if (path === "/health") {
     res.writeHead(200);
     res.end(JSON.stringify({
-      status: "ok",
-      source: cache.source,
-      normalCount: cache.normalStock.length,
-      mirageCount: cache.mirageStock.length,
-      lastUpdated: cache.lastUpdated,
+      status:       "ok",
+      source:       cache.source,
+      normalCount:  cache.normalStock.length,
+      mirageCount:  cache.mirageStock.length,
+      lastUpdated:  cache.lastUpdated,
     }));
     return;
   }
-
-  // ── /force-refresh — manually trigger a new scrape ──
   if (path === "/force-refresh") {
-    refresh(); // fire and forget
+    refresh();
     res.writeHead(202);
-    res.end(JSON.stringify({ message: "Refresh started — check /stock in a few seconds" }));
+    res.end(JSON.stringify({ message: "Refresh started — check /stock in ~5 seconds" }));
     return;
   }
 
@@ -224,13 +238,11 @@ const server = http.createServer((req, res) => {
 
 // ── Start ─────────────────────────────────────────────────────────
 server.listen(PORT, async () => {
-  console.log(`\n🍈 FruitAlarm backend v3 running on port ${PORT}`);
-  console.log(`   Source: fruityblox.com/stock`);
-  console.log(`   Auto-refresh: every 4 hours\n`);
-  // Fetch immediately on boot
+  console.log(`\n🍈 FruitAlarm backend v4`);
+  console.log(`   Port    : ${PORT}`);
+  console.log(`   Source 1: blox-fruits-api.onrender.com`);
+  console.log(`   Source 2: Fandom Wiki (fallback)\n`);
   await refresh();
-  // Then every 4 hours (Normal stock cycle)
-  setInterval(refresh, 4 * 60 * 60 * 1000);
-  // Also refresh at every Mirage reset (every 2 hours)
+  // Refresh every 2 hours (covers both Normal 4h and Mirage 2h cycles)
   setInterval(refresh, 2 * 60 * 60 * 1000);
 });
