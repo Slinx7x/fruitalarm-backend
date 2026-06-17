@@ -246,8 +246,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // /debug — shows raw Discord messages to diagnose Vulcan format
+  if (path === "/debug") {
+    discordGet(`/channels/${CHANNEL_ID}/messages?limit=5`)
+      .then(({ status, data }) => {
+        const simplified = Array.isArray(data) ? data.map(m => ({
+          id:      m.id,
+          author:  m.author?.username,
+          content: m.content,
+          embeds:  m.embeds,
+        })) : data;
+        res.writeHead(200);
+        res.end(JSON.stringify(simplified, null, 2));
+      })
+      .catch(e => {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: e.message }));
+      });
+    return;
+  }
+
   res.writeHead(404);
-  res.end(JSON.stringify({ error: "Try /stock or /health" }));
+  res.end(JSON.stringify({ error: "Try /stock, /health, /debug or /force-refresh" }));
 });
 
 // ── Start ─────────────────────────────────────────────────────────
