@@ -385,5 +385,5 @@ server.listen(PORT, async () => {
   console.log(`   Token set       : ${!!DISCORD_TOKEN}`);
   console.log(`   Firebase key    : ${!!FIREBASE_KEY}\n`);
   await refresh();
-  setInterval(refresh, 5 * 60 * 1000);
+  setInterval(refresh, 1 * 60 * 1000);
 });
