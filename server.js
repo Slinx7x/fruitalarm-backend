@@ -1,13 +1,16 @@
 // ================================================================
-//  FruitAlarm Backend v4
-//  Uses blox-fruits-api.onrender.com — real JSON stock API
-//  No scraping, no HTML parsing. Clean JSON in, clean JSON out.
-//  Falls back to Fandom Wiki text parse if API is down.
+//  FruitAlarm Backend v6
+//  Reads Vulcan bot's stock embed from your Discord server
+//  No scraping. No broken APIs. Real stock from Discord.
 // ================================================================
 
-const https = require("https");
-const http  = require("http");
-const PORT  = process.env.PORT || 3000;
+const https  = require("https");
+const http   = require("http");
+const PORT   = process.env.PORT || 3000;
+
+// ── Config (set these in Render environment variables) ────────────
+const DISCORD_TOKEN  = process.env.DISCORD_TOKEN;   // your bot token
+const CHANNEL_ID     = process.env.CHANNEL_ID || "1516502352281075884";
 
 // ── Cache ─────────────────────────────────────────────────────────
 let cache = {
@@ -19,160 +22,166 @@ let cache = {
   source:          "pending",
 };
 
-// ── Known fruit IDs — must match fruits.js exactly ───────────────
+// ── Known fruit names (exact spelling Vulcan uses) ────────────────
 const KNOWN_FRUITS = new Set([
-  "rocket","spin","blade","spring","bomb","smoke","spike",
-  "flame","ice","sand","dark","eagle","diamond",
-  "light","rubber","ghost","magma",
-  "quake","buddha","love","creation","spider","sound",
-  "portal","phoenix","lightning","blizzard","pain",
-  "gravity","mammoth","trex","dough","shadow",
-  "venom","gas","spirit","tiger","yeti","kitsune","control","dragon",
+  "Rocket","Spin","Blade","Spring","Bomb","Smoke","Spike",
+  "Flame","Ice","Sand","Dark","Eagle","Diamond",
+  "Light","Rubber","Ghost","Magma",
+  "Quake","Buddha","Love","Creation","Spider","Sound",
+  "Portal","Phoenix","Lightning","Blizzard","Pain",
+  "Gravity","Mammoth","T-Rex","Dough","Shadow",
+  "Venom","Gas","Spirit","Tiger","Yeti","Kitsune","Control","Dragon",
 ]);
 
-// Normalise any fruit name/slug → our fruit id
-function toId(raw) {
-  return raw
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]/g, "")  // remove dashes, spaces, special chars
-    .replace("trex", "trex");   // keep as-is
+// Convert display name → our fruit id (matches fruits.js)
+function toId(name) {
+  return name.toLowerCase().replace(/[^a-z]/g,"").replace("trex","trex");
 }
 
-// ── Simple HTTPS GET ──────────────────────────────────────────────
-function get(hostname, path) {
+// ── Discord API call ──────────────────────────────────────────────
+function discordGet(path) {
   return new Promise((resolve, reject) => {
     const req = https.request(
       {
-        hostname,
-        path,
-        method: "GET",
+        hostname: "discord.com",
+        path:     `/api/v10${path}`,
+        method:   "GET",
         headers: {
-          "User-Agent": "FruitAlarm/4.0 (fan project; github.com/fruitalarm)",
-          "Accept":     "application/json, text/html",
+          "Authorization": `Bot ${DISCORD_TOKEN}`,
+          "Content-Type":  "application/json",
+          "User-Agent":    "FruitAlarm (fan project, v6)",
         },
-        timeout: 12000,
+        timeout: 10000,
       },
       res => {
         let body = "";
         res.on("data", c => body += c);
-        res.on("end", () => resolve({ status: res.statusCode, body }));
+        res.on("end", () => {
+          try { resolve({ status: res.statusCode, data: JSON.parse(body) }); }
+          catch(e) { resolve({ status: res.statusCode, data: body }); }
+        });
       }
     );
-    req.on("error",   reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Discord API timeout")); });
     req.end();
   });
 }
 
-// ── SOURCE 1: blox-fruits-api.onrender.com ───────────────────────
-// Returns JSON like:
-// { "Normal": ["Flame","Ice","Diamond"], "Mirage": ["Kitsune","Dough"] }
-// (exact format may vary — we handle multiple possible shapes)
-async function fetchFromCommunityAPI() {
-  const { status, body } = await get(
-    "blox-fruits-api.onrender.com",
-    "/api/bloxfruits/stock"
-  );
+// ── Parse Vulcan embed ────────────────────────────────────────────
+// Vulcan sends an embed with fields like:
+//   "Spring • $ 60,000"
+//   "Smoke • $ 100,000"
+// Section headers: "NORMAL STOCK" and "MIRAGE STOCK"
+// We find fruit names before the " • $" separator
+function parseVulcanEmbed(embeds) {
+  const normalStock = [];
+  const mirageStock = [];
 
-  if (status !== 200) throw new Error(`API returned HTTP ${status}`);
+  for (const embed of embeds) {
+    // Check embed title or description for NORMAL/MIRAGE sections
+    const fullText = [
+      embed.title || "",
+      embed.description || "",
+      ...(embed.fields || []).map(f => `${f.name}\n${f.value}`),
+    ].join("\n");
 
-  // The API may return a JSON string or object
-  let data = body;
-  if (typeof data === "string") {
-    data = JSON.parse(data);
-    // API wraps in another string sometimes
-    if (typeof data === "string") data = JSON.parse(data);
-  }
+    const lines = fullText.split("\n");
+    let currentSection = "normal"; // default to normal
 
-  // Handle multiple possible response shapes
-  let normalRaw = [];
-  let mirageRaw = [];
+    for (const line of lines) {
+      const clean = line.trim();
 
-  if (Array.isArray(data)) {
-    // Shape: [ { name:"Flame", type:"normal" }, ... ]
-    normalRaw = data.filter(f => (f.type||"").toLowerCase() !== "mirage").map(f => f.name || f.fruit || f);
-    mirageRaw = data.filter(f => (f.type||"").toLowerCase() === "mirage").map(f => f.name || f.fruit || f);
-  } else if (data.Normal || data.normal) {
-    // Shape: { Normal: [...], Mirage: [...] }
-    normalRaw = data.Normal || data.normal || [];
-    mirageRaw = data.Mirage || data.mirage || [];
-  } else if (data.stock) {
-    normalRaw = data.stock;
-  } else {
-    // Last resort — grab any array values
-    const vals = Object.values(data);
-    normalRaw = vals.find(v => Array.isArray(v)) || [];
-  }
+      // Detect section headers
+      if (/NORMAL\s*STOCK/i.test(clean)) { currentSection = "normal"; continue; }
+      if (/MIRAGE\s*STOCK/i.test(clean)) { currentSection = "mirage"; continue; }
 
-  const normalStock = normalRaw.map(toId).filter(id => KNOWN_FRUITS.has(id));
-  const mirageStock = mirageRaw.map(toId).filter(id => KNOWN_FRUITS.has(id));
-
-  if (normalStock.length === 0) throw new Error("API returned 0 valid fruits");
-
-  return { normalStock, mirageStock, source: "community-api" };
-}
-
-// ── SOURCE 2: Fandom Wiki plain text (fallback) ───────────────────
-// The wiki's raw action=raw endpoint returns clean Lua text
-// with fruit names we can regex out easily
-async function fetchFromWiki() {
-  const { status, body } = await get(
-    "blox-fruits.fandom.com",
-    "/wiki/Blox_Fruits_%22Stock%22?action=raw"
-  );
-
-  if (status !== 200) throw new Error(`Wiki returned HTTP ${status}`);
-
-  const found = [];
-  // Wiki raw format has fruit names as wiki links: [[FruitName]]
-  const pattern = /\[\[([A-Za-z\-]+)\]\]/g;
-  let m;
-  while ((m = pattern.exec(body)) !== null) {
-    const id = toId(m[1]);
-    if (KNOWN_FRUITS.has(id) && !found.includes(id)) found.push(id);
-  }
-
-  if (found.length === 0) throw new Error("Wiki parse returned 0 fruits");
-
-  return { normalStock: found, mirageStock: [], source: "wiki" };
-}
-
-// ── Next reset times ──────────────────────────────────────────────
-function nextReset(cycleHours) {
-  const now   = new Date();
-  const sec   = now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
-  const cycle = cycleHours * 3600;
-  return new Date(now.getTime() + (cycle - sec % cycle) * 1000).toISOString();
-}
-
-// ── Main refresh — tries sources in order ─────────────────────────
-async function refresh() {
-  console.log(`\n[${new Date().toISOString()}] Refreshing stock...`);
-
-  let result = null;
-
-  // Try community API first
-  try {
-    result = await fetchFromCommunityAPI();
-    console.log(`✅ Community API → Normal: ${result.normalStock.join(", ")||"none"}`);
-    console.log(`✅ Community API → Mirage: ${result.mirageStock.join(", ")||"none"}`);
-  } catch (e) {
-    console.warn(`⚠️  Community API failed: ${e.message}`);
-  }
-
-  // Fallback to wiki
-  if (!result) {
-    try {
-      result = await fetchFromWiki();
-      console.log(`✅ Wiki fallback → Normal: ${result.normalStock.join(", ")||"none"}`);
-    } catch (e) {
-      console.warn(`⚠️  Wiki fallback failed: ${e.message}`);
+      // Extract fruit name — Vulcan format: "FruitName • $ 60,000"
+      // Also handle: "FruitName • $60,000" or just "FruitName"
+      const fruitMatch = clean.match(/^([A-Za-z\-]+)\s*[•·]\s*\$?/);
+      if (fruitMatch) {
+        const name = fruitMatch[1].trim();
+        // Find matching known fruit (case insensitive)
+        for (const known of KNOWN_FRUITS) {
+          if (known.toLowerCase() === name.toLowerCase()) {
+            const id = toId(known);
+            if (currentSection === "normal" && !normalStock.includes(id)) {
+              normalStock.push(id);
+            } else if (currentSection === "mirage" && !mirageStock.includes(id)) {
+              mirageStock.push(id);
+            }
+            break;
+          }
+        }
+      }
     }
   }
 
-  // Update cache
-  if (result) {
+  return { normalStock, mirageStock };
+}
+
+// ── Fetch latest Vulcan message from channel ──────────────────────
+async function fetchFromDiscord() {
+  if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN not set in environment variables");
+
+  // Get last 20 messages from the stock channel
+  const { status, data } = await discordGet(
+    `/channels/${CHANNEL_ID}/messages?limit=20`
+  );
+
+  if (status === 401) throw new Error("Invalid bot token — check DISCORD_TOKEN");
+  if (status === 403) throw new Error("Bot doesn't have permission to read this channel");
+  if (status === 404) throw new Error("Channel not found — check CHANNEL_ID");
+  if (status !== 200) throw new Error(`Discord API error: HTTP ${status}`);
+
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("No messages found in channel");
+  }
+
+  // Find the most recent message from Vulcan that has embeds with stock data
+  for (const msg of data) {
+    // Vulcan sends embeds — look for messages with embeds containing "STOCK"
+    if (!msg.embeds || msg.embeds.length === 0) continue;
+
+    const hasStockEmbed = msg.embeds.some(e =>
+      (e.title || "").toUpperCase().includes("STOCK") ||
+      (e.description || "").toUpperCase().includes("STOCK") ||
+      (e.fields || []).some(f =>
+        f.name.toUpperCase().includes("STOCK") ||
+        f.value.toUpperCase().includes("STOCK")
+      ) ||
+      // Also check for "NORMAL" or "MIRAGE" keywords
+      JSON.stringify(e).toUpperCase().includes("NORMAL") ||
+      JSON.stringify(e).toUpperCase().includes("MIRAGE")
+    );
+
+    if (!hasStockEmbed) continue;
+
+    // Parse the embed
+    const { normalStock, mirageStock } = parseVulcanEmbed(msg.embeds);
+
+    if (normalStock.length > 0 || mirageStock.length > 0) {
+      console.log(`✅ Found Vulcan stock message (ID: ${msg.id})`);
+      return { normalStock, mirageStock, source: "discord-vulcan" };
+    }
+  }
+
+  throw new Error("No valid Vulcan stock embed found in last 20 messages");
+}
+
+// ── Next reset times ──────────────────────────────────────────────
+function nextReset(hours) {
+  const now   = new Date();
+  const sec   = now.getUTCHours()*3600 + now.getUTCMinutes()*60 + now.getUTCSeconds();
+  const cycle = hours * 3600;
+  return new Date(now.getTime() + (cycle - sec % cycle) * 1000).toISOString();
+}
+
+// ── Main refresh ──────────────────────────────────────────────────
+async function refresh() {
+  console.log(`\n[${new Date().toISOString()}] Refreshing stock from Discord...`);
+  try {
+    const result = await fetchFromDiscord();
     cache = {
       normalStock:     result.normalStock,
       mirageStock:     result.mirageStock,
@@ -181,22 +190,25 @@ async function refresh() {
       nextResetMirage: nextReset(2),
       source:          result.source,
     };
-  } else if (cache.normalStock.length > 0) {
-    // Keep stale cache
-    cache.source      = "cached";
-    cache.lastUpdated = new Date().toISOString();
-    console.log(`⚠️  All sources failed — serving stale cache`);
-  } else {
-    // Absolute last resort
-    cache = {
-      normalStock:     ["rocket", "spin"],
-      mirageStock:     [],
-      lastUpdated:     new Date().toISOString(),
-      nextResetNormal: nextReset(4),
-      nextResetMirage: nextReset(2),
-      source:          "fallback",
-    };
-    console.log(`❌ All sources failed — serving minimal fallback`);
+    console.log(`✅ Normal: ${result.normalStock.join(", ") || "none"}`);
+    console.log(`✅ Mirage: ${result.mirageStock.join(", ") || "none"}`);
+  } catch(e) {
+    console.error(`❌ Discord fetch failed: ${e.message}`);
+    if (cache.normalStock.length > 0) {
+      cache.source      = "cached";
+      cache.lastUpdated = new Date().toISOString();
+      console.log(`⚠️  Serving cached stock: ${cache.normalStock.join(", ")}`);
+    } else {
+      cache = {
+        normalStock:     [],
+        mirageStock:     [],
+        lastUpdated:     new Date().toISOString(),
+        nextResetNormal: nextReset(4),
+        nextResetMirage: nextReset(2),
+        source:          "fallback",
+      };
+      console.log(`⚠️  No cache available — serving empty stock`);
+    }
   }
 }
 
@@ -217,32 +229,33 @@ const server = http.createServer((req, res) => {
   if (path === "/health") {
     res.writeHead(200);
     res.end(JSON.stringify({
-      status:       "ok",
-      source:       cache.source,
-      normalCount:  cache.normalStock.length,
-      mirageCount:  cache.mirageStock.length,
-      lastUpdated:  cache.lastUpdated,
+      status:      "ok",
+      source:      cache.source,
+      normalCount: cache.normalStock.length,
+      mirageCount: cache.mirageStock.length,
+      lastUpdated: cache.lastUpdated,
+      tokenSet:    !!DISCORD_TOKEN,
+      channelId:   CHANNEL_ID,
     }));
     return;
   }
   if (path === "/force-refresh") {
     refresh();
     res.writeHead(202);
-    res.end(JSON.stringify({ message: "Refresh started — check /stock in ~5 seconds" }));
+    res.end(JSON.stringify({ message: "Refreshing — check /stock in 5 seconds" }));
     return;
   }
 
   res.writeHead(404);
-  res.end(JSON.stringify({ error: "Not found. Try /stock or /health" }));
+  res.end(JSON.stringify({ error: "Try /stock or /health" }));
 });
 
 // ── Start ─────────────────────────────────────────────────────────
 server.listen(PORT, async () => {
-  console.log(`\n🍈 FruitAlarm backend v4`);
-  console.log(`   Port    : ${PORT}`);
-  console.log(`   Source 1: blox-fruits-api.onrender.com`);
-  console.log(`   Source 2: Fandom Wiki (fallback)\n`);
+  console.log(`\n🍈 FruitAlarm backend v6`);
+  console.log(`   Channel : ${CHANNEL_ID}`);
+  console.log(`   Token   : ${DISCORD_TOKEN ? "✅ set" : "❌ MISSING — set DISCORD_TOKEN in Render"}`);
   await refresh();
-  // Refresh every 2 hours (covers both Normal 4h and Mirage 2h cycles)
-  setInterval(refresh, 2 * 60 * 60 * 1000);
+  // Refresh every 30 minutes — catches stock updates quickly
+  setInterval(refresh, 30 * 60 * 1000);
 });
