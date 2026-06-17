@@ -69,47 +69,57 @@ function discordGet(path) {
 }
 
 // ── Parse Vulcan embed ────────────────────────────────────────────
-// Vulcan sends an embed with fields like:
-//   "Spring • $ 60,000"
-//   "Smoke • $ 100,000"
-// Section headers: "NORMAL STOCK" and "MIRAGE STOCK"
-// We find fruit names before the " • $" separator
+// Actual Vulcan format (from /debug):
+// field.name = "**NORMAL STOCK**" or "**MIRAGE STOCK**"
+// field.value = "<:spring:1300167775947460709> **Spring • <:money:...>`60,000`**\n..."
+//
+// Steps:
+// 1. Check field name for NORMAL or MIRAGE
+// 2. Strip all Discord emoji tags <:name:id> from value
+// 3. Strip markdown bold **text**
+// 4. Extract fruit name before the " • " separator
 function parseVulcanEmbed(embeds) {
   const normalStock = [];
   const mirageStock = [];
 
   for (const embed of embeds) {
-    // Check embed title or description for NORMAL/MIRAGE sections
-    const fullText = [
-      embed.title || "",
-      embed.description || "",
-      ...(embed.fields || []).map(f => `${f.name}\n${f.value}`),
-    ].join("\n");
+    const fields = embed.fields || [];
 
-    const lines = fullText.split("\n");
-    let currentSection = "normal"; // default to normal
+    for (const field of fields) {
+      // Determine section from field name
+      const fieldName = field.name || "";
+      let section = null;
+      if (/NORMAL/i.test(fieldName)) section = "normal";
+      if (/MIRAGE/i.test(fieldName)) section = "mirage";
+      if (!section) continue;
 
-    for (const line of lines) {
-      const clean = line.trim();
+      const target = section === "normal" ? normalStock : mirageStock;
 
-      // Detect section headers
-      if (/NORMAL\s*STOCK/i.test(clean)) { currentSection = "normal"; continue; }
-      if (/MIRAGE\s*STOCK/i.test(clean)) { currentSection = "mirage"; continue; }
+      // Process each line in the field value
+      const lines = (field.value || "").split("\n");
+      for (const line of lines) {
+        // Remove Discord custom emoji tags: <:name:id>
+        let clean = line.replace(/<:[^>]+>/g, "");
+        // Remove markdown bold **
+        clean = clean.replace(/\*\*/g, "");
+        // Remove backtick numbers like `60,000`
+        clean = clean.replace(/`[^`]+`/g, "");
+        // Remove -# (Discord subtext prefix)
+        clean = clean.replace(/^-#/, "");
+        clean = clean.trim();
 
-      // Extract fruit name — Vulcan format: "FruitName • $ 60,000"
-      // Also handle: "FruitName • $60,000" or just "FruitName"
-      const fruitMatch = clean.match(/^([A-Za-z\-]+)\s*[•·]\s*\$?/);
-      if (fruitMatch) {
-        const name = fruitMatch[1].trim();
-        // Find matching known fruit (case insensitive)
+        // Now line looks like: "Spring • " or "Spring • "
+        // Extract the fruit name — everything before " • "
+        const parts = clean.split("•");
+        if (parts.length < 2) continue;
+        const name = parts[0].trim();
+        if (!name) continue;
+
+        // Match against known fruits
         for (const known of KNOWN_FRUITS) {
           if (known.toLowerCase() === name.toLowerCase()) {
             const id = toId(known);
-            if (currentSection === "normal" && !normalStock.includes(id)) {
-              normalStock.push(id);
-            } else if (currentSection === "mirage" && !mirageStock.includes(id)) {
-              mirageStock.push(id);
-            }
+            if (!target.includes(id)) target.push(id);
             break;
           }
         }
