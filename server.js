@@ -229,12 +229,15 @@ async function fetchFromDiscord() {
   // Scan all recent messages — collect Normal and Mirage separately
   // because stockalert posts them as two separate messages
   for (const msg of data) {
-    if (!msg.embeds?.length) continue;
+    if (!msg.embeds?.length) {
+      console.log(`  Skipping msg ${msg.id} — no embeds`);
+      continue;
+    }
+    console.log(`  Parsing msg ${msg.id} from "${msg.author?.username}" — ${msg.embeds.length} embed(s)`);
     const { normalStock: n, mirageStock: m } = parseVulcanEmbed(msg.embeds);
-    // Take the first (most recent) valid result for each type
+    console.log(`  → Normal: [${n.join(",")}] Mirage: [${m.join(",")}]`);
     if (n.length > 0 && normalStock.length === 0) normalStock = n;
     if (m.length > 0 && mirageStock.length === 0) mirageStock = m;
-    // Stop once we have both
     if (normalStock.length > 0 && mirageStock.length > 0) break;
   }
 
