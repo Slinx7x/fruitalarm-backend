@@ -223,19 +223,26 @@ async function fetchFromDiscord() {
   if (status !== 200) throw new Error(`Discord API error: HTTP ${status}`);
   if (!Array.isArray(data) || data.length === 0) throw new Error("No messages in channel");
 
+  let normalStock = [];
+  let mirageStock = [];
+
+  // Scan all recent messages — collect Normal and Mirage separately
+  // because stockalert posts them as two separate messages
   for (const msg of data) {
     if (!msg.embeds?.length) continue;
-    const hasStock = msg.embeds.some(e =>
-      JSON.stringify(e).toUpperCase().includes("NORMAL") ||
-      JSON.stringify(e).toUpperCase().includes("MIRAGE")
-    );
-    if (!hasStock) continue;
-    const { normalStock, mirageStock } = parseVulcanEmbed(msg.embeds);
-    if (normalStock.length > 0 || mirageStock.length > 0) {
-      return { normalStock, mirageStock, source: "discord-vulcan" };
-    }
+    const { normalStock: n, mirageStock: m } = parseVulcanEmbed(msg.embeds);
+    // Take the first (most recent) valid result for each type
+    if (n.length > 0 && normalStock.length === 0) normalStock = n;
+    if (m.length > 0 && mirageStock.length === 0) mirageStock = m;
+    // Stop once we have both
+    if (normalStock.length > 0 && mirageStock.length > 0) break;
   }
-  throw new Error("No valid Vulcan stock embed found");
+
+  if (normalStock.length === 0 && mirageStock.length === 0) {
+    throw new Error("No valid Vulcan stock found in last 20 messages");
+  }
+
+  return { normalStock, mirageStock, source: "discord-vulcan" };
 }
 
 function nextReset(hours) {
@@ -385,5 +392,5 @@ server.listen(PORT, async () => {
   console.log(`   Token set       : ${!!DISCORD_TOKEN}`);
   console.log(`   Firebase key    : ${!!FIREBASE_KEY}\n`);
   await refresh();
-  setInterval(refresh, 1 * 60 * 1000);
+  setInterval(refresh, 30 * 60 * 1000);
 });
